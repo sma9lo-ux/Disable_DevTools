@@ -1,0 +1,8 @@
+USE :
+<script src="https://dunggramer.github.io/disable-devtool/disable-devtool.min.js" defer></script>
+
+OR :
+<script src="https://cdn.staticaly.com/gh/DungGramer/disable-devtool/cbf447f/disable-devtool.min.js" defer></script>
+
+OR :
+<script src="https://gitcdn.xyz/repo/DungGramer/disable-devtool/master/disable-devtool.min.js" defer></script>
