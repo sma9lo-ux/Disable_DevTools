@@ -1,0 +1,12 @@
+// ==UserScript==
+// @name         Simple DevTools Bypass
+// @match        *://*/*
+// @run-at       document-start
+// ==/UserScript==
+(() => {
+  // Override debugger keyword
+  const origDebug = window.Debugger;
+  Object.defineProperty(window, 'debugger', { get: () => false });
+  // Prevent detection of devtools open
+  window.__devtoolsOpen = false;
+})();
