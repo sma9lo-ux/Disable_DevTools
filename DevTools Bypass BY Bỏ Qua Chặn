@@ -1,0 +1,666 @@
+// ==UserScript==
+// @name         DevTools Bypass
+// @name:vi      Bỏ Qua Chặn DevTools
+// @name:zh-CN   开发工具限制绕过
+// @name:ru      Разблокировка DevTools
+// @namespace    https://greasyfork.org/vi/users/1195312-renji-yuusei
+// @version      2024.12.23.2
+// @description  Bypass for website restrictions on DevTools with enhanced protection
+// @description:vi Bỏ qua các hạn chế của trang web về DevTools với bảo vệ nâng cao
+// @description:zh-CN 绕过网站对开发工具的限制，具有增强的保护功能
+// @description:ru   Разблокировка DevTools с усиленной защитой
+// @author       Yuusei
+// @match        *://*/*
+// @grant        unsafeWindow
+// @run-at       document-start
+// @license      GPL-3.0-only
+// @downloadURL https://update.greasyfork.org/scripts/511714/DevTools%20Bypass.user.js
+// @updateURL https://update.greasyfork.org/scripts/511714/DevTools%20Bypass.meta.js
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  // Constants
+  const CONSTANTS = {
+    PREFIX: '[DevTools Bypass]',
+    LOG_LEVELS: {
+      INFO: 'info',
+      WARN: 'warn', 
+      ERROR: 'error',
+      DEBUG: 'debug'
+    },
+    TIME_THRESHOLDS: {
+      DEBUGGER: 80,
+      CACHE: 30000
+    }
+  };
+
+  // Configuration
+  const config = {
+    debugPatterns: {
+      basic: /[;\s]*(?:debugger|debug(?:ger)?|breakpoint|console\.[a-z]+)[\s;]*/gi,
+      advanced: /(?:debugger|debug(?:ger)?|breakpoint|devtools?)(?:\s*\{[\s\S]*?\}|\s*\([^)]*\)|\s*;|\s*$)/gi,
+      timing: /(?:performance(?:\.timing)?|Date)\.(?:now|getTime)\(\)|new\s+Date(?:\s*\(\s*\))?\s*\.getTime\(\)/gi,
+      eval: /(?:eval|Function|setTimeout|setInterval)\s*\(\s*(?:[`'"].*?(?:debugger|debug|breakpoint).*?[`'"]|\{[\s\S]*?(?:debugger|debug|breakpoint)[\s\S]*?\})\s*\)/gi,
+      devtools: /(?:isDevTools?|devtools?|debugMode|debug_mode|debugEnabled)\s*[=:]\s*(?:true|1|!0|yes)/gi,
+      consoleCheck: /console\.(?:log|warn|error|info|debug|trace|dir|table)\s*\([^)]*\)/gi,
+      functionDebug: /function\s*[^(]*\([^)]*\)\s*\{(?:\s|.)*?(?:debugger|debug|breakpoint)(?:\s|.)*?\}/gi,
+      sourceMap: /\/\/[#@]\s*source(?:Mapping)?URL\s*=\s*(?:data:|https?:)?\/\/.*?$/gm,
+      debugStrings: /(['"`])(?:(?!\1).)*?(?:debug|debugger|breakpoint|devtools?)(?:(?!\1).)*?\1/gi,
+      debugComments: /\/\*[\s\S]*?(?:debug|debugger|breakpoint|devtools?)[\s\S]*?\*\/|\/\/.*(?:debug|debugger|breakpoint|devtools?).*$/gim
+    },
+    consoleProps: ['log', 'warn', 'error', 'info', 'debug', 'trace', 'dir', 'dirxml', 'table', 'profile', 'group', 'groupEnd', 'time', 'timeEnd'],
+    cutoffs: {
+      debugger: { amount: 30, within: CONSTANTS.TIME_THRESHOLDS.CACHE },
+      debuggerThrow: { amount: 30, within: CONSTANTS.TIME_THRESHOLDS.CACHE }
+    },
+    bypassTriggers: {
+      timeThreshold: CONSTANTS.TIME_THRESHOLDS.DEBUGGER,
+      stackDepth: 30,
+      recursionLimit: 50
+    },
+    logging: {
+      enabled: true,
+      prefix: CONSTANTS.PREFIX,
+      levels: Object.values(CONSTANTS.LOG_LEVELS),
+      detailedErrors: true
+    },
+    protection: {
+      preventDevToolsKeys: true,
+      hideStackTraces: true,
+      sanitizeErrors: true,
+      obfuscateTimers: true,
+      preventRightClick: true,
+      preventViewSource: true,
+      preventCopy: true,
+      preventPaste: true,
+      preventPrint: true,
+      preventSave: true
+    }
+  };
+
+  // Logger class
+  class Logger {
+    static #instance;
+    #lastLog = 0;
+    #logCount = 0;
+    #logBuffer = [];
+
+    constructor() {
+      if (Logger.#instance) {
+        return Logger.#instance;
+      }
+      Logger.#instance = this;
+      this.#setupBufferFlush();
+    }
+
+    #setupBufferFlush() {
+      setInterval(() => {
+        if (this.#logBuffer.length) {
+          this.#flushBuffer();
+        }
+      }, 1000);
+    }
+
+    #flushBuffer() {
+      this.#logBuffer.forEach(({level, args}) => {
+        console[level](config.logging.prefix, ...args);
+      });
+      this.#logBuffer = [];
+    }
+
+    #shouldLog() {
+      const now = Date.now();
+      if (now - this.#lastLog > 1000) {
+        this.#logCount = 0;
+      }
+      this.#lastLog = now;
+      return ++this.#logCount <= 10;
+    }
+
+    #log(level, ...args) {
+      if (!config.logging.enabled || !this.#shouldLog()) return;
+      this.#logBuffer.push({ level, args });
+    }
+
+    info(...args) { this.#log(CONSTANTS.LOG_LEVELS.INFO, ...args); }
+    warn(...args) { this.#log(CONSTANTS.LOG_LEVELS.WARN, ...args); }
+    error(...args) { this.#log(CONSTANTS.LOG_LEVELS.ERROR, ...args); }
+    debug(...args) { this.#log(CONSTANTS.LOG_LEVELS.DEBUG, ...args); }
+  }
+
+  // Original functions store
+  const OriginalFunctions = {
+    defineProperty: Object.defineProperty,
+    getOwnPropertyDescriptor: Object.getOwnPropertyDescriptor,
+    setTimeout: window.setTimeout,
+    setInterval: window.setInterval,
+    Date: window.Date,
+    now: Date.now,
+    performance: window.performance,
+    Function: window.Function,
+    eval: window.eval,
+    console: {},
+    toString: Function.prototype.toString,
+    preventDefault: Event.prototype.preventDefault,
+    getComputedStyle: window.getComputedStyle,
+    addEventListener: window.addEventListener,
+    removeEventListener: window.removeEventListener,
+    fetch: window.fetch,
+    XMLHttpRequest: window.XMLHttpRequest,
+
+    initConsole() {
+      config.consoleProps.forEach(prop => {
+        if (console[prop]) {
+          this.console[prop] = console[prop].bind(console);
+        }
+      });
+    }
+  };
+
+  OriginalFunctions.initConsole();
+
+  // Debugger detector
+  class DebuggerDetector {
+    static #detectionCache = new Map();
+    static #detectionHistory = [];
+
+    static isPresent() {
+      try {
+        const cacheKey = 'debugger_check';
+        const cached = this.#detectionCache.get(cacheKey);
+        if (cached && Date.now() - cached.timestamp < 500) {
+          return cached.result;
+        }
+
+        const startTime = OriginalFunctions.now.call(Date);
+        new Function('debugger;')();
+        const timeDiff = OriginalFunctions.now.call(Date) - startTime;
+
+        const result = timeDiff > config.bypassTriggers.timeThreshold;
+        this.#detectionCache.set(cacheKey, {
+          result,
+          timestamp: Date.now()
+        });
+
+        this.#detectionHistory.push({
+          timestamp: Date.now(),
+          result,
+          timeDiff
+        });
+
+        // Keep history for 5 minutes
+        const fiveMinutesAgo = Date.now() - 300000;
+        this.#detectionHistory = this.#detectionHistory.filter(entry => entry.timestamp > fiveMinutesAgo);
+
+        return result;
+      } catch {
+        return false;
+      }
+    }
+
+    static analyzeStack() {
+      try {
+        const stack = new Error().stack;
+        const frames = stack.split('\n');
+        const uniqueFrames = new Set(frames);
+
+        return {
+          depth: frames.length,
+          hasDebugKeywords: frames.some(frame => 
+            Object.values(config.debugPatterns).some(pattern => pattern.test(frame))
+          ),
+          isRecursive: uniqueFrames.size < frames.length,
+          suspiciousPatterns: this.#detectSuspiciousPatterns(stack),
+          stackHash: this.#generateStackHash(stack)
+        };
+      } catch {
+        return {
+          depth: 0,
+          hasDebugKeywords: false,
+          isRecursive: false,
+          suspiciousPatterns: [],
+          stackHash: ''
+        };
+      }
+    }
+
+    static #detectSuspiciousPatterns(stack) {
+      const patterns = [
+        /eval.*?\(/g,
+        /Function.*?\(/g,
+        /debugger/g,
+        /debug/g,
+        /DevTools/g,
+        /console\./g,
+        /chrome-extension/g
+      ];
+      return patterns.filter(pattern => pattern.test(stack));
+    }
+
+    static #generateStackHash(stack) {
+      return Array.from(stack).reduce((hash, char) => {
+        hash = ((hash << 5) - hash) + char.charCodeAt(0);
+        return hash & hash;
+      }, 0).toString(36);
+    }
+
+    static getDetectionStats() {
+      const now = Date.now();
+      const recentDetections = this.#detectionHistory.filter(entry => 
+        entry.timestamp > now - 60000
+      );
+
+      return {
+        total: recentDetections.length,
+        positive: recentDetections.filter(entry => entry.result).length,
+        averageTime: recentDetections.reduce((acc, curr) => 
+          acc + curr.timeDiff, 0) / recentDetections.length || 0
+      };
+    }
+  }
+
+  // Helper functions
+  const BypassHelpers = {
+    disableAntiDebugging: {
+      patchTimingChecks() {
+        const originalNow = Date.now;
+        Date.now = function() {
+          return originalNow.call(this) - Math.random() * 100;
+        };
+      },
+
+      patchStackTraces() {
+        Error.prepareStackTrace = (_, stack) => 
+          stack.filter(frame => !frame.toString().includes('debugger'));
+      },
+
+      patchDebugChecks() {
+        const noop = () => {};
+        window.debug = noop;
+        window.debugger = noop;
+        window.isDebuggerEnabled = false;
+      }
+    },
+
+    debugTools: {
+      monitorAPICalls() {
+        const originalFetch = window.fetch;
+        window.fetch = async (...args) => {
+          console.log('[API Call]', ...args);
+          return originalFetch.apply(this, args);
+        };
+      },
+
+      monitorDOMEvents() {
+        new MutationObserver(mutations => {
+          mutations.forEach(mutation => {
+            console.log('[DOM Change]', mutation);
+          });
+        }).observe(document.body, {
+          childList: true,
+          subtree: true
+        });
+      }
+    }
+  };
+
+  // Protection class
+  class Protection {
+    static applyAll() {
+      this.#protectTimers();
+      this.#protectTiming();
+      this.#protectFunction();
+      this.#protectStack();
+      this.#protectEval();
+      this.#protectConsole();
+      this.#setupMutationObserver();
+      this.#protectDevToolsKeys();
+      this.#protectRightClick();
+      this.#protectViewSource();
+      this.#protectNetwork();
+      this.#protectStorage();
+      this.#protectClipboard();
+      this.#protectPrinting();
+      this.#protectWebWorkers();
+      this.#enableDebuggingHelpers();
+    }
+
+    static #protectTimers() {
+      const wrapTimer = original => {
+        return function(handler, timeout, ...args) {
+          if (typeof handler !== 'function') {
+            return original.apply(this, arguments);
+          }
+
+          const wrappedHandler = function() {
+            try {
+              if (DebuggerDetector.isPresent()) return;
+              return handler.apply(this, arguments);
+            } catch (e) {
+              if (e.message?.includes('debugger')) return;
+              throw e;
+            }
+          };
+
+          if (config.protection.obfuscateTimers) {
+            timeout = Math.max(1, timeout + (Math.random() * 20 - 10));
+          }
+
+          return original.call(this, wrappedHandler, timeout, ...args);
+        };
+      };
+
+      window.setTimeout = wrapTimer(OriginalFunctions.setTimeout);
+      window.setInterval = wrapTimer(OriginalFunctions.setInterval);
+    }
+
+    static #protectTiming() {
+      const timeOffset = Math.random() * 25;
+      const safeNow = () => OriginalFunctions.now.call(Date) + timeOffset;
+
+      Object.defineProperty(Date, 'now', {
+        value: safeNow,
+        configurable: false,
+        writable: false
+      });
+
+      if (window.performance?.now) {
+        Object.defineProperty(window.performance, 'now', {
+          value: safeNow,
+          configurable: false,
+          writable: false
+        });
+      }
+    }
+
+    static #protectFunction() {
+      const handler = {
+        apply(target, thisArg, args) {
+          if (typeof args[0] === 'string') {
+            args[0] = Protection.#cleanCode(args[0]);
+          }
+          return Reflect.apply(target, thisArg, args);
+        },
+        construct(target, args) {
+          if (typeof args[0] === 'string') {
+            args[0] = Protection.#cleanCode(args[0]);
+          }
+          return Reflect.construct(target, args);
+        }
+      };
+
+      window.Function = new Proxy(OriginalFunctions.Function, handler);
+      if (typeof unsafeWindow !== 'undefined') {
+        unsafeWindow.Function = window.Function;
+      }
+    }
+
+    static #protectStack() {
+      if (!config.protection.hideStackTraces) return;
+
+      const errorHandler = {
+        get(target, prop) {
+          if (prop === 'stack') {
+            return Protection.#cleanCode(target.stack);
+          }
+          return target[prop];
+        }
+      };
+
+      const originalErrorPrototype = Error.prototype;
+      const proxyErrorPrototype = Object.create(originalErrorPrototype);
+
+      Object.defineProperty(proxyErrorPrototype, 'stack', {
+        get() {
+          return Protection.#cleanCode(new Error().stack);
+        },
+        configurable: true
+      });
+
+      try {
+        Error.prototype = proxyErrorPrototype;
+      } catch (e) {
+        logger.error('Failed to protect stack traces:', e);
+      }
+    }
+
+    static #protectEval() {
+      const safeEval = function(code) {
+        if (typeof code === 'string') {
+          if (DebuggerDetector.isPresent()) return;
+          return OriginalFunctions.eval.call(this, Protection.#cleanCode(code));
+        }
+        return OriginalFunctions.eval.apply(this, arguments);
+      };
+
+      Object.defineProperty(window, 'eval', {
+        value: safeEval,
+        configurable: false,
+        writable: false
+      });
+
+      if (typeof unsafeWindow !== 'undefined') {
+        unsafeWindow.eval = safeEval;
+      }
+    }
+
+    static #protectConsole() {
+      const consoleHandler = {
+        get(target, prop) {
+          if (!config.consoleProps.includes(prop)) return target[prop];
+
+          return function(...args) {
+            if (DebuggerDetector.isPresent()) return;
+            return OriginalFunctions.console[prop]?.apply(console, args);
+          };
+        },
+        set(target, prop, value) {
+          if (config.consoleProps.includes(prop)) return true;
+          target[prop] = value;
+          return true;
+        }
+      };
+
+      window.console = new Proxy(console, consoleHandler);
+    }
+
+    static #setupMutationObserver() {
+      new MutationObserver(mutations => {
+        mutations.forEach(mutation => {
+          if (mutation.type === 'childList') {
+            mutation.addedNodes.forEach(node => {
+              if (node.tagName === 'SCRIPT') {
+                const originalContent = node.textContent;
+                const cleanedContent = Protection.#cleanCode(originalContent);
+                if (originalContent !== cleanedContent) {
+                  node.textContent = cleanedContent;
+                }
+              }
+            });
+          }
+        });
+      }).observe(document, {
+        childList: true,
+        subtree: true
+      });
+    }
+
+    static #protectDevToolsKeys() {
+      if (!config.protection.preventDevToolsKeys) return;
+
+      const handler = e => {
+        const { keyCode, ctrlKey, shiftKey, altKey } = e;
+        if (
+          keyCode === 123 || // F12
+          (ctrlKey && shiftKey && keyCode === 73) || // Ctrl+Shift+I
+          (ctrlKey && shiftKey && keyCode === 74) || // Ctrl+Shift+J
+          (ctrlKey && keyCode === 85) || // Ctrl+U
+          (altKey && keyCode === 68) // Alt+D
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        }
+      };
+
+      window.addEventListener('keydown', handler, true);
+      window.addEventListener('keyup', handler, true);
+      window.addEventListener('keypress', handler, true);
+    }
+
+    static #protectRightClick() {
+      if (!config.protection.preventRightClick) return;
+
+      window.addEventListener('contextmenu', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        return false;
+      }, true);
+    }
+
+    static #protectViewSource() {
+      if (!config.protection.preventViewSource) return;
+
+      const handler = e => {
+        if (
+          (e.ctrlKey && (e.key === 'u' || e.key === 's')) || // Ctrl+U, Ctrl+S
+          (e.ctrlKey && e.shiftKey && e.key === 'i') || // Ctrl+Shift+I
+          (e.ctrlKey && e.shiftKey && e.key === 'j') || // Ctrl+Shift+J
+          (e.ctrlKey && e.shiftKey && e.key === 'c') || // Ctrl+Shift+C
+          e.key === 'F12'
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          return false;
+        }
+      };
+
+      window.addEventListener('keydown', handler, true);
+      document.addEventListener('keydown', handler, true);
+
+      window.addEventListener('beforeunload', e => {
+        if (window.location.protocol === 'view-source:') {
+          e.preventDefault();
+          return false;
+        }
+      });
+    }
+
+    static #protectNetwork() {
+      window.fetch = async function(...args) {
+        if (DebuggerDetector.isPresent()) {
+          throw new Error('Network request blocked');
+        }
+        return OriginalFunctions.fetch.apply(this, args);
+      };
+
+      window.XMLHttpRequest = function() {
+        const xhr = new OriginalFunctions.XMLHttpRequest();
+        const originalOpen = xhr.open;
+        xhr.open = function(...args) {
+          if (DebuggerDetector.isPresent()) {
+            throw new Error('Network request blocked');
+          }
+          return originalOpen.apply(xhr, args);
+        };
+        return xhr;
+      };
+    }
+
+    static #protectStorage() {
+      const storageHandler = {
+        get(target, prop) {
+          if (DebuggerDetector.isPresent()) return null;
+          return target[prop];
+        },
+        set(target, prop, value) {
+          if (DebuggerDetector.isPresent()) return true;
+          target[prop] = value;
+          return true;
+        }
+      };
+
+      window.localStorage = new Proxy(window.localStorage, storageHandler);
+      window.sessionStorage = new Proxy(window.sessionStorage, storageHandler);
+    }
+
+    static #protectClipboard() {
+      if (!config.protection.preventCopy) return;
+
+      document.addEventListener('copy', e => {
+        e.preventDefault();
+      }, true);
+
+      document.addEventListener('cut', e => {
+        e.preventDefault();
+      }, true);
+
+      if (config.protection.preventPaste) {
+        document.addEventListener('paste', e => {
+          e.preventDefault();
+        }, true);
+      }
+    }
+
+    static #protectPrinting() {
+      if (!config.protection.preventPrint) return;
+
+      window.addEventListener('beforeprint', e => {
+        e.preventDefault();
+      }, true);
+
+      window.addEventListener('afterprint', e => {
+        e.preventDefault();
+      }, true);
+    }
+
+    static #protectWebWorkers() {
+      window.Worker = function(scriptURL, options) {
+        console.log('[Worker Created]', scriptURL);
+        return new OriginalFunctions.Worker(scriptURL, options);
+      };
+    }
+
+    static #enableDebuggingHelpers() {
+      BypassHelpers.disableAntiDebugging.patchTimingChecks();
+      BypassHelpers.disableAntiDebugging.patchStackTraces();
+      BypassHelpers.debugTools.monitorAPICalls();
+      BypassHelpers.debugTools.monitorDOMEvents();
+    }
+
+    static #cleanCode(code) {
+      if (typeof code !== 'string') return code;
+
+      let cleanCode = code
+        .replace(/\/\/[#@]\s*source(?:Mapping)?URL\s*=.*$/gm, '')
+        .replace(/(['"`])(?:(?!\1).)*?(?:debug|debugger|devtools?)(?:(?!\1).)*?\1/gi, match => `'${btoa(match)}'`)
+        .replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '')
+        .replace(/debugger|debug\s*\(|console\.[a-z]+/gi, '');
+
+      Object.values(config.debugPatterns).forEach(pattern => {
+        cleanCode = cleanCode.replace(pattern, '');
+      });
+
+      return cleanCode
+        .replace(/function\s*\(/g, 'function /*debug*/(')
+        .replace(/return\s+/g, 'return /*debug*/ ');
+    }
+  }
+
+  // Main class
+  class DevToolsBypass {
+    static init() {
+      try {
+        Protection.applyAll();
+        logger.info('DevTools Bypass initialized successfully');
+      } catch (e) {
+        logger.error('Failed to initialize DevTools Bypass:', e);
+      }
+    }
+  }
+
+  // Initialize
+  DevToolsBypass.init();
+})();
